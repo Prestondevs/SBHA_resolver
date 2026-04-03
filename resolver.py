@@ -1,5 +1,6 @@
 import z3
 
+#1 char = 8 bits, 16 chars = 128
 input = z3.BitVec('char', 128)
 solver = z3.Solver()
 
