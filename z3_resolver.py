@@ -1,6 +1,6 @@
 import z3
 
-#input_gates = length of password & returns solver.model or if unsat none/null
+# input_gates = length of password & returns solver.model or if unsat none/null
 def analyze_gates(input_gates: int) -> modelRef | None:
 
     # 1 char = 8 bits, 16 chars = 128
