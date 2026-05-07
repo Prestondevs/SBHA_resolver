@@ -10,8 +10,15 @@ based chain of calls to tiny Boolean gate helpers.
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
+import importlib.util
+import json
 import struct
+import subprocess
 import sys
+import threading
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +30,163 @@ And = Bool = Not = Or = Solver = Xor = is_true = sat = None
 
 IMAGE_BASE_DEFAULT = 0x140000000
 MIN_INPUT_BITS = 8
+
+
+ASCII_BANNER = r"""
+                         @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%
+                         @                              @@@@@
+                         @                                   @@@
+                         @                                      @@
+    @ @*                 @                                       @@@
+   @@@@@-  *@@@@@@@@@@@@@@                                         @@
+   @   @.                @                                          @@
+   @   @*                @                                           @+
+                         @                                           @@                     :
+                         @                                            @                @@  @@
+                         @                                            @@@@@@@@@@@@@@@    @@
+                         @                                            @                  .@
+                         @                                           @@                  -@
+   @@@@                  @                                           @@
+   @   @@                @                                          @@
+   @@@@@   *@@@@@@@@@@@@@@                                         @@
+   @   @@                @                                        @@
+   @@@@                  @                                      @@
+                         @                                   @@@
+                         @                               @@@@@
+                         @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+"""
+
+
+LIGHT_COLORS = {
+    "mint": "\033[38;2;165;230;199m",
+    "mint_strong": "\033[38;2;0;255;132m",
+    "blue": "\033[38;2;112;214;255m",
+    "yellow": "\033[38;2;238;218;159m",
+    "purple": "\033[38;2;214;178;255m",
+    "green": "\033[38;2;144;238;184m",
+    "red": "\033[38;2;255;145;164m",
+}
+
+
+def color_text(value, group: str) -> str:
+    if not sys.stdout.isatty():
+        return str(value)
+    color = LIGHT_COLORS.get(group, "")
+    if not color:
+        return str(value)
+    return f"{color}{value}\033[0m"
+
+
+def status_marker(kind: str) -> str:
+    markers = {
+        "ok": ("[+]", "green"),
+        "work": ("[*]", "blue"),
+        "warn": ("[!]", "yellow"),
+        "err": ("[-]", "red"),
+    }
+    marker, color = markers.get(kind, ("[*]", "blue"))
+    return color_text(marker, color)
+
+
+def log_status(progress, enabled: bool, kind: str, message: str) -> None:
+    if not enabled:
+        return
+    if progress is not None:
+        progress.newline()
+    print(f"{status_marker(kind)} {message}")
+
+
+def print_banner(enabled: bool, solver: str | None = None, target: Path | None = None) -> None:
+    if enabled:
+        print(color_text(ASCII_BANNER, "mint"))
+        print(f"{color_text('SBHA Solver Framework', 'mint_strong')} {color_text('v0.4', 'yellow')}")
+        if solver is not None:
+            print(f"mode: {color_text(solver, 'blue')}")
+        if target is not None:
+            print(f"target: {color_text(target.name, 'purple')}")
+        print()
+
+
+class TextProgress:
+    def __init__(self, enabled: bool = True, width: int = 32):
+        self.enabled = enabled
+        self.width = width
+        self.color_enabled = enabled and sys.stdout.isatty()
+        self.frames = "/-\\|"
+        self.index = 0
+        self.frame = self.frames[0]
+        self.last_spin = 0.0
+        self.spin_interval = 0.25
+        self.last_len = 0
+
+    def color_for_percent(self, percent: float) -> str:
+        if not self.color_enabled:
+            return ""
+        if percent >= 100.0:
+            r, g, b = 0, 255, 132
+        elif percent >= 75.0:
+            r, g, b = 49, 236, 153
+        elif percent >= 50.0:
+            r, g, b = 91, 225, 166
+        elif percent >= 25.0:
+            r, g, b = 128, 217, 178
+        else:
+            r, g, b = 165, 230, 199
+        return f"\033[38;2;{r};{g};{b}m"
+
+    def update(self, percent: float, label: str) -> None:
+        if not self.enabled:
+            return
+        percent = max(0.0, min(100.0, percent))
+        filled = int(self.width * percent / 100.0)
+        now = time.perf_counter()
+        if now - self.last_spin >= self.spin_interval:
+            self.frame = self.frames[self.index % len(self.frames)]
+            self.index += 1
+            self.last_spin = now
+        spinner = self.frame
+        if filled >= self.width:
+            bar = "#" * self.width
+        else:
+            bar = "#" * filled + spinner + "." * max(0, self.width - filled - 1)
+        color = self.color_for_percent(percent)
+        reset = "\033[0m" if color else ""
+        visible_text = f"[{bar}] {percent:6.2f}% {label}"
+        text = f"\r{color}{visible_text}{reset}"
+        padding = " " * max(0, self.last_len - len(visible_text))
+        print(text + padding, end="", flush=True)
+        self.last_len = len(visible_text)
+
+    def finish(self, label: str = "done") -> None:
+        self.update(100.0, label)
+        if self.enabled:
+            print()
+            self.last_len = 0
+
+    def newline(self) -> None:
+        if self.enabled and self.last_len:
+            print()
+            self.last_len = 0
+
+
+def run_with_spinner(progress: TextProgress, percent: float, label: str, func):
+    result = {}
+
+    def target():
+        try:
+            result["value"] = func()
+        except BaseException as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    while thread.is_alive():
+        progress.update(percent, label)
+        time.sleep(0.1)
+    thread.join()
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
 
 
 @dataclass(frozen=True)
@@ -199,7 +363,7 @@ def parse_imul_rax_rax_immediate(code: bytes, i: int):
     return None
 
 
-def function_bytes_from_start(view: PEView, start_va: int, max_size: int = 0x8000) -> bytes:
+def function_bytes_from_start(view: PEView, start_va: int, max_size: int = 0x800000) -> bytes:
     offset = start_va - view.text_va
     code = view.text_data[offset : offset + max_size]
     epilogue = code.find(b"\x48\x81\xc4")
@@ -360,7 +524,7 @@ def classify_gate(view: PEView, call_va: int) -> str:
     raise ValueError(f"could not classify gate helper at {call_va:#x} -> {real_va:#x}")
 
 
-def reconstruct_expression(view: PEView, candidate: Candidate):
+def reconstruct_expression(view: PEView, candidate: Candidate, progress: TextProgress | None = None):
     bits = [Bool(f"bit_{i}") for i in range(candidate.input_bit_count)]
     values = {stack_offset: bits[input_index] for stack_offset, input_index in candidate.input_loads.items()}
     gates: list[tuple[str, int, tuple[int, ...]]] = []
@@ -369,7 +533,11 @@ def reconstruct_expression(view: PEView, candidate: Candidate):
 
     i = 0
     code = candidate.code
+    next_progress = 0
     while i < len(code):
+        if progress is not None and i >= next_progress:
+            progress.update(20.0 + (45.0 * i / max(1, len(code))), f"phase=recover_gates offset={i:#x}")
+            next_progress = i + max(1, len(code) // 200)
         one = parse_movzx_temp(code, i)
         if not one:
             i += 1
@@ -440,68 +608,241 @@ def format_gate_source(stack_offset: int, input_loads: dict[int, int]) -> str:
     return f"tmp[{stack_offset:#x}]"
 
 
-def print_gate_structure(gates: list[tuple[str, int, tuple[int, ...]]], input_loads: dict[int, int]):
+def format_gate_structure(gates: list[tuple[str, int, tuple[int, ...]]], input_loads: dict[int, int]) -> str:
     gate_counts = Counter(name for name, _, _ in gates)
     counts_text = ", ".join(f"{name}={gate_counts[name]}" for name in sorted(gate_counts))
-    print(f"gate_counts: {counts_text}")
-    print("gate_structure:")
+    lines = [f"gate_counts: {counts_text}", "gate_structure:"]
     for index, (name, dst, srcs) in enumerate(gates):
         src_text = ", ".join(format_gate_source(src, input_loads) for src in srcs)
-        print(f"  {index:03}: tmp[{dst:#x}] = {name}({src_text})")
+        lines.append(f"  {index:03}: tmp[{dst:#x}] = {name}({src_text})")
+    return "\n".join(lines) + "\n"
 
 
-def solve(path: Path, dump_gates: bool):
+def print_gate_structure(gates: list[tuple[str, int, tuple[int, ...]]], input_loads: dict[int, int]):
+    print(format_gate_structure(gates, input_loads), end="")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_password(path: Path, password: str, timeout: float = 10.0) -> bool:
+    completed = subprocess.run(
+        [str(path)],
+        input=password + "\n",
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+    )
+    return "Access granted!" in completed.stdout
+
+
+def write_json_result(path: Path, result: dict) -> None:
+    path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def append_csv_result(path: Path, result: dict) -> None:
+    fields = [
+        "timestamp",
+        "solver",
+        "exe",
+        "sha256",
+        "checker_va",
+        "input_bits",
+        "gates",
+        "password",
+        "elapsed_seconds",
+        "verified",
+    ]
+    row = {field: result.get(field, "") for field in fields}
+    row["gate_counts"] = json.dumps(result.get("gate_counts", {}), sort_keys=True)
+    fields.append("gate_counts")
+    exists = path.exists()
+    with path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def print_dependencies() -> None:
+    print(f"python: {sys.version.split()[0]}")
+    for package in ("pefile", "z3"):
+        spec = importlib.util.find_spec(package)
+        status = spec.origin if spec and spec.origin else "missing"
+        print(f"{package}: {status}")
+
+
+def result_color(group: str) -> str:
+    if not sys.stdout.isatty():
+        return ""
+    return LIGHT_COLORS.get(group, "")
+
+
+def color_value(value, group: str) -> str:
+    return color_text(value, group)
+
+
+def print_result_box(result: dict, gate_stats: bool) -> None:
+    print(color_text("+-- result ----------------------------------------", "mint"))
+    print(f"| checker_va: {color_value(result['checker_va'], 'blue')}")
+    print(f"| input_bits: {color_value(result['input_bits'], 'yellow')}")
+    print(f"| input_loads: {color_value(result['input_loads'], 'yellow')}")
+    print(f"| gates: {color_value(result['gates'], 'blue')}")
+    print(f"| final_stack_offset: {color_value(result['final_stack_offset'], 'blue')}")
+    print(f"| bits: {result['bits']}")
+    if result.get("password") is not None:
+        print(f"| password: {color_value(repr(result['password']), 'purple')}")
+    else:
+        print("| password: <not shown; recovered bit count is not byte-aligned>")
+    if "verified" in result:
+        verified_group = "green" if result["verified"] else "red"
+        print(f"| verified: {color_value(result['verified'], verified_group)}")
+    elapsed_text = f"{result['elapsed_seconds']:.3f}"
+    print(f"| elapsed_seconds: {color_value(elapsed_text, 'yellow')}")
+    if gate_stats:
+        counts_text = ", ".join(f"{name}={count}" for name, count in sorted(result["gate_counts"].items()))
+        print(f"| gate_stats: total={color_value(result['gates'], 'blue')}; {color_value(counts_text, 'blue')}")
+    print(color_text("+--------------------------------------------------", "mint"))
+
+
+def emit_result(result: dict, *, quiet: bool, summary: bool, verbose: bool, gate_stats: bool) -> None:
+    if quiet:
+        if result.get("password") is not None:
+            print(color_value(result["password"], "purple"))
+        else:
+            print(result["bits"])
+        return
+
+    elapsed_text = f"{result['elapsed_seconds']:.3f}"
+    if summary:
+        print(
+            f"{status_marker('ok')} solved "
+            f"target={color_value(Path(result['exe']).name, 'purple')} "
+            f"mode={color_value(result['solver'], 'blue')} "
+            f"bits={color_value(result['input_bits'], 'yellow')} "
+            f"gates={color_value(result['gates'], 'blue')} "
+            f"elapsed={color_value(elapsed_text + 's', 'yellow')} "
+            f"password={color_value(repr(result.get('password')), 'purple')}"
+        )
+        if "verified" in result:
+            print(f"verified: {result['verified']}")
+        if gate_stats:
+            counts_text = ", ".join(f"{name}={count}" for name, count in sorted(result["gate_counts"].items()))
+            print(f"gate_stats: total={color_value(result['gates'], 'blue')}; {color_value(counts_text, 'blue')}")
+    else:
+        print_result_box(result, gate_stats)
+    if verbose:
+        print(f"exe_sha256: {result['sha256']}")
+
+
+def solve(path: Path, args):
+    solve_start = time.perf_counter()
+    dump_to_stdout = args.dump_gates == "-"
+    output_enabled = not args.quiet and not dump_to_stdout
+    print_banner(output_enabled, "static-z3", path)
+    progress = TextProgress(enabled=not args.no_progress and not args.quiet and not dump_to_stdout)
     global And, Bool, Not, Or, Solver, Xor, is_true, sat
     from z3 import And, Bool, Not, Or, Solver, Xor, is_true, sat
 
+    progress.update(0.0, "phase=load_target")
     view = PEView(path)
+    log_status(progress, output_enabled, "ok", f"target loaded path={color_value(path.name, 'purple')}")
+    progress.update(8.0, "phase=find_checker")
     candidates = find_checker_candidates(view)
     if not candidates:
         raise RuntimeError("could not find a checker function with contiguous input-bit loads")
-    if len(candidates) > 1:
+    if len(candidates) > 1 and not args.quiet:
+        progress.newline()
         print(
-            f"[!] found {len(candidates)} checker-like functions; "
-            f"using {candidates[0].va:#x} with {candidates[0].input_bit_count} bits"
+            f"{status_marker('warn')} found {color_value(len(candidates), 'yellow')} checker-like functions; "
+            f"using {color_value(f'{candidates[0].va:#x}', 'blue')} with "
+            f"{color_value(candidates[0].input_bit_count, 'yellow')} bits"
         )
 
     candidate = candidates[0]
-    bits, output_expr, gates, final_offset = reconstruct_expression(view, candidate)
+    log_status(progress, output_enabled, "ok", f"checker recovered va={color_value(f'{candidate.va:#x}', 'blue')}")
+    progress.update(18.0, "phase=recover_gates")
+    bits, output_expr, gates, final_offset = reconstruct_expression(view, candidate, progress)
+    log_status(progress, output_enabled, "ok", f"gates reconstructed count={color_value(len(gates), 'blue')}")
+    progress.update(68.0, "phase=build_z3")
 
-    print(f"checker_va: {candidate.va:#x}")
-    print(f"recovered_input_bits: {candidate.input_bit_count}")
-    print(f"recovered_input_loads: {len(candidate.input_loads)}")
-    print(f"recovered_gates: {len(gates)}")
-    print(f"final_stack_offset: {final_offset:#x}")
-
-    if dump_gates:
-        print_gate_structure(gates, candidate.input_loads)
+    if args.dump_gates:
+        gate_text = format_gate_structure(gates, candidate.input_loads)
+        if args.dump_gates == "-":
+            progress.newline()
+            print(gate_text, end="")
+        else:
+            Path(args.dump_gates).write_text(gate_text, encoding="utf-8")
 
     solver = Solver()
     solver.add(output_expr)
-    result = solver.check()
+    result = run_with_spinner(progress, 82.0, "phase=z3_solve", solver.check)
     if result != sat:
         raise RuntimeError(f"Z3 could not satisfy output[0] == true: {result}")
 
+    log_status(progress, output_enabled, "ok", "z3 model solved")
+    progress.update(94.0, "phase=extract_model")
     model = solver.model()
     bit_values = [is_true(model.eval(bit, model_completion=True)) for bit in bits]
     bit_string = "".join("1" if bit else "0" for bit in bit_values)
+    progress.finish("solved")
 
-    print(f"bits: {bit_string}")
-    if len(bit_values) % 8 == 0:
-        password = bits_to_password(bit_values)
-        print(f"password: {password!r}")
-    else:
-        print("password: <not shown; recovered bit count is not byte-aligned>")
+    password = bits_to_password(bit_values) if len(bit_values) % 8 == 0 else None
+    elapsed = time.perf_counter() - solve_start
+    gate_counts = Counter(name for name, _, _ in gates)
+    run_result = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "solver": "static-z3",
+        "exe": str(path),
+        "sha256": sha256_file(path),
+        "checker_va": f"{candidate.va:#x}",
+        "input_bits": candidate.input_bit_count,
+        "input_loads": len(candidate.input_loads),
+        "gates": len(gates),
+        "gate_counts": dict(sorted(gate_counts.items())),
+        "final_stack_offset": f"{final_offset:#x}",
+        "bits": bit_string,
+        "password": password,
+        "elapsed_seconds": elapsed,
+    }
+    if args.verify_run and password is not None:
+        run_result["verified"] = verify_password(path, password)
+    if args.json_out:
+        write_json_result(args.json_out, run_result)
+    if args.csv_log:
+        append_csv_result(args.csv_log, run_result)
+    emit_result(run_result, quiet=args.quiet, summary=args.summary, verbose=args.verbose, gate_stats=args.gate_stats)
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("exe", type=Path, help="Path to the compiled SBHA-style PE executable")
-    parser.add_argument("--dump-gates", action="store_true", help="Print recovered stack-slot gate operations")
+    parser = argparse.ArgumentParser(description=__doc__, add_help=False)
+    parser.add_argument("-h", "--help", "--h", action="help", help="Show this help message and exit")
+    parser.add_argument("exe", type=Path, nargs="?", help="Path to the compiled SBHA-style PE executable")
+    parser.add_argument("--json-out", type=Path, help="Write solve result as JSON")
+    parser.add_argument("--summary", action="store_true", help="Print a compact one-line summary")
+    parser.add_argument("--no-progress", action="store_true", help="Disable animated progress output")
+    parser.add_argument("--csv-log", type=Path, metavar="runs.csv", help="Append run result to a CSV log")
+    parser.add_argument("--verify-run", action="store_true", help="Run the EXE with the recovered password and check for success text")
+    parser.add_argument("--gate-stats", action="store_true", help="Print gate count statistics")
+    parser.add_argument("--dump-gates", nargs="?", const="-", metavar="gates.txt", help="Write recovered gate structure to a file, or stdout if no file is given")
+    parser.add_argument("--quiet", action="store_true", help="Print only the recovered password, or bits if not byte-aligned")
+    parser.add_argument("--verbose", "--v", "-v", action="store_true", help="Print extra diagnostic metadata")
+    parser.add_argument("--depend", action="store_true", help="Check solver dependencies and exit")
     args = parser.parse_args(argv)
 
+    if args.depend:
+        print_dependencies()
+        return 0
+    if args.exe is None:
+        parser.error("exe is required unless --depend is used")
+
     try:
-        solve(args.exe, args.dump_gates)
+        solve(args.exe, args)
     except ModuleNotFoundError as exc:
         if exc.name == "z3":
             print("z3 is not installed. Install it with: python -m pip install z3-solver", file=sys.stderr)
